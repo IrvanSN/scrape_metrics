@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 import psutil
-import subprocess
-import re
 import datetime
 import requests  # pip install requests
 import time
@@ -13,88 +11,65 @@ NGINX_STATUS_URL = "http://127.0.0.1/stub_status"
 OUTPUT_FILE = "/tmp/system_stats.csv"
 STATE_FILE = "/tmp/.nginx_requests_state.json"  # To store last requests count & timestamp
 
-def get_top_cpu_info():
+def get_system_usage():
     """
-    Use psutil to get:
-      - overall CPU usage
-      - top 5 processes by CPU usage (command and %CPU)
+    Returns overall system CPU and memory usage.
+    CPU usage is measured over a short interval.
     """
-    # overall CPU usage (in %)
+    # This call blocks for 0.1 sec to measure CPU usage over that interval.
     cpu_usage = psutil.cpu_percent(interval=0.1)
+    mem_usage = psutil.virtual_memory().percent
+    return cpu_usage, mem_usage
 
-    # gather processes with CPU usage
-    # Note: calling cpu_percent() *immediately* after process_iter() can be 0.0
-    #       so an interval above helps usage to settle.
-    procs = []
-    for p in psutil.process_iter(['pid', 'name', 'cmdline', 'cpu_percent']):
+def get_top_processes_info():
+    """
+    Uses psutil to retrieve the top 5 processes sorted by CPU and memory usage.
+    Returns:
+        top_cpu: list of tuples (process_command, cpu_percent)
+        top_mem: list of tuples (process_command, mem_percent)
+    """
+    # Gather all processes with basic info.
+    procs = list(psutil.process_iter(['pid', 'name', 'cmdline']))
+
+    # Initialize per-process CPU percent measurements.
+    for proc in procs:
         try:
-            info = p.info
-            # By default, psutil returns the CPU usage since last call.
-            # We already gave a small interval=0.1, so it should be populated.
-            procs.append(info)
+            proc.cpu_percent(interval=None)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
 
-    # sort descending by cpu_percent
-    procs.sort(key=lambda x: x['cpu_percent'], reverse=True)
+    # Wait a short time to allow CPU usage to be computed.
+    time.sleep(0.1)
 
-    # Build the top 5 list
-    top_cpu_list = []
-    for proc in procs[:5]:
-        cmd = " ".join(proc['cmdline']) if proc['cmdline'] else proc['name']
-        cpu_str = f"{proc['cpu_percent']:.1f}"
-        top_cpu_list.append((cmd, cpu_str))
-
-    return {
-        "cpu_usage": cpu_usage,
-        "top_cpu": top_cpu_list
-    }
-
-def get_top_mem_info():
-    """
-    Use psutil to get:
-      - overall memory usage in %
-      - top 5 processes by memory usage (command and %MEM)
-    """
-    # overall memory usage
-    mem = psutil.virtual_memory()
-    mem_usage = mem.percent
-
-    procs = []
-    for p in psutil.process_iter(['pid', 'name', 'cmdline', 'memory_percent']):
+    cpu_info_list = []
+    mem_info_list = []
+    for proc in procs:
         try:
-            info = p.info
-            procs.append(info)
+            cpu = proc.cpu_percent(interval=None)
+            mem = proc.memory_percent()
+            # Use the full command line if available; otherwise, use the process name.
+            cmd = " ".join(proc.info.get('cmdline', [])) if proc.info.get('cmdline') else proc.info.get('name', '')
+            cpu_info_list.append((cmd, cpu))
+            mem_info_list.append((cmd, mem))
         except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
+            continue
 
-    # sort descending by memory_percent
-    procs.sort(key=lambda x: x['memory_percent'], reverse=True)
-
-    top_mem_list = []
-    for proc in procs[:5]:
-        cmd = " ".join(proc['cmdline']) if proc['cmdline'] else proc['name']
-        mem_str = f"{proc['memory_percent']:.1f}"
-        top_mem_list.append((cmd, mem_str))
-
-    return {
-        "mem_usage": mem_usage,
-        "top_mem": top_mem_list
-    }
+    # Sort and select the top 5 processes by CPU and memory usage.
+    top_cpu = sorted(cpu_info_list, key=lambda x: x[1], reverse=True)[:5]
+    top_mem = sorted(mem_info_list, key=lambda x: x[1], reverse=True)[:5]
+    return top_cpu, top_mem
 
 def get_nginx_stub_status(url=NGINX_STATUS_URL):
     """
     Fetch the nginx stub status page and parse:
       - active_connections (int)
       - total_requests (int)  -> cumulative requests
-
-    If there's any error, return (0, 0).
+    If there's any error, returns (0, 0).
     """
     try:
         response = requests.get(url, timeout=2)
         response.raise_for_status()
     except requests.RequestException:
-        # Return 0 if there's any error
         return 0, 0
 
     text = response.text.strip()
@@ -108,7 +83,7 @@ def get_nginx_stub_status(url=NGINX_STATUS_URL):
     active_connections = 0
     total_requests = 0
 
-    # Attempt to parse active connections
+    # Parse active connections.
     try:
         for line in lines:
             if line.startswith("Active connections:"):
@@ -119,9 +94,7 @@ def get_nginx_stub_status(url=NGINX_STATUS_URL):
     except (ValueError, IndexError):
         active_connections = 0
 
-    # Attempt to parse total requests
-    # Typically in the stub, the 3rd line has "server accepts handled requests"
-    # The next line might be something like " 1234 1234 2468"
+    # Parse total requests from the third line (commonly in the format "1234 1234 2468").
     try:
         line_with_requests = lines[2].strip()
         parts = line_with_requests.split()
@@ -134,105 +107,88 @@ def get_nginx_stub_status(url=NGINX_STATUS_URL):
 
 def compute_requests_per_second(current_requests):
     """
-    Reads last known requests count & timestamp from STATE_FILE.
-    Returns the requests_per_second and updates the state file
-    with the current requests count and current timestamp.
-
-    If there's no prior state, returns 0.0 on first run.
+    Reads the last known requests count and timestamp from the STATE_FILE.
+    Returns the computed requests per second and updates the state file
+    with the current count and timestamp.
+    If there is no prior state, returns 0.0.
     """
     now = time.time()
-
-    # If no state file, create it
     if not os.path.isfile(STATE_FILE):
         with open(STATE_FILE, 'w') as f:
             json.dump({"last_requests": current_requests, "last_time": now}, f)
         return 0.0
 
-    # Read the previous state
     try:
         with open(STATE_FILE, 'r') as f:
             state = json.load(f)
             last_requests = state.get("last_requests", 0)
             last_time = state.get("last_time", now)
     except (json.JSONDecodeError, FileNotFoundError):
-        # If file is corrupted or not found
         last_requests = current_requests
         last_time = now
 
     elapsed = now - last_time if now > last_time else 1.0
     diff_requests = current_requests - last_requests
     if diff_requests < 0:
-        # if total_requests resets, we clamp to 0
         diff_requests = 0
 
     rps = diff_requests / elapsed
 
-    # Update state
     with open(STATE_FILE, 'w') as f:
         json.dump({"last_requests": current_requests, "last_time": now}, f)
 
     return rps
 
 def main():
-    # 1. Get CPU info
-    cpu_info = get_top_cpu_info()
-    cpu_usage = cpu_info["cpu_usage"]
-    top_cpu = cpu_info["top_cpu"]
+    # 1. Get overall system usage.
+    cpu_usage, mem_usage = get_system_usage()
 
-    # 2. Get MEM info
-    mem_info = get_top_mem_info()
-    mem_usage = mem_info["mem_usage"]
-    top_mem = mem_info["top_mem"]
+    # 2. Get top 5 processes by CPU and memory usage.
+    top_cpu, top_mem = get_top_processes_info()
 
-    # 3. Get NGINX stub info
+    # 3. Get NGINX status.
     nginx_active_connections, nginx_total_requests = get_nginx_stub_status()
-
-    # Compute requests per second
     nginx_requests_ps = compute_requests_per_second(nginx_total_requests)
 
-    # Flatten top CPU and top MEM info into CSV-friendly fields
+    # Prepare CSV fields.
+    # Flatten top CPU info into name and usage pairs.
     top_cpu_fields = []
     for i in range(5):
         if i < len(top_cpu):
             proc_name, proc_val = top_cpu[i]
+            proc_val = f"{proc_val:.2f}"
         else:
             proc_name, proc_val = "", ""
-        top_cpu_fields.append(proc_name)
-        top_cpu_fields.append(proc_val)
+        top_cpu_fields.extend([proc_name, proc_val])
 
+    # Flatten top Memory info into name and usage pairs.
     top_mem_fields = []
     for i in range(5):
         if i < len(top_mem):
             proc_name, proc_val = top_mem[i]
+            proc_val = f"{proc_val:.2f}"
         else:
             proc_name, proc_val = "", ""
-        top_mem_fields.append(proc_name)
-        top_mem_fields.append(proc_val)
+        top_mem_fields.extend([proc_name, proc_val])
 
-    # Prepare CSV line with ";" as separator
     now_str = datetime.datetime.now().isoformat()
 
-    # Example columns:
-    # [ timestamp, cpu_usage, top_1_cpu_proc_name, top_1_cpu_proc_usage, ...,
-    #   mem_usage, top_1_mem_proc_name, top_1_mem_proc_usage, ...,
-    #   nginx_active_connections, nginx_requests_ps ]
+    # Compose the CSV row:
+    # [timestamp; overall_cpu; (top 5 CPU process names & usages); overall_mem; (top 5 mem process names & usages);
+    #  nginx_active_connections; nginx_requests_ps]
     row_items = [
         now_str,
-        str(f"{cpu_usage:.2f}"),
-        *top_cpu_fields,     # 10 fields (5 name+usage pairs)
-        str(f"{mem_usage:.2f}"),
-        *top_mem_fields,     # 10 fields
+        f"{cpu_usage:.2f}",
+        *top_cpu_fields,  # 10 fields (5 name,usage pairs)
+        f"{mem_usage:.2f}",
+        *top_mem_fields,  # 10 fields (5 name,usage pairs)
         str(nginx_active_connections),
-        str(f"{nginx_requests_ps:.2f}")
+        f"{nginx_requests_ps:.2f}"
     ]
-
-    # Join with ';'
     csv_line = ";".join(row_items) + "\n"
 
-    # Print to console
+    # Print the CSV line to console and append to output file.
     print(csv_line, end="")
-
-    # Append to file
     with open(OUTPUT_FILE, "a") as f:
         f.write(csv_line)
 

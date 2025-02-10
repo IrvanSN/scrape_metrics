@@ -15,53 +15,36 @@ STATE_FILE = "/tmp/.nginx_requests_state.json"  # To store last requests count &
 
 def get_top_cpu_info():
     """
-    Run top -b -n 1 -w 512 -c -o %CPU and parse:
-      - overall CPU usage (from %Cpu(s) line)
-      - top 5 processes by CPU usage (full command, %CPU)
+    Get overall CPU usage using psutil and top processes by CPU usage.
+
     Returns a dict with:
         {
           "cpu_usage": float,
           "top_cpu": [(proc_name, cpu_usage), ... up to 5]
         }
     """
+    # Use psutil for a reliable overall CPU usage percentage.
+    cpu_usage = psutil.cpu_percent(interval=0.1)
+
+    # Run top to get per-process CPU info.
     cmd = ["top", "-b", "-n", "1", "-w", "512", "-c", "-o", "%CPU"]
     output = subprocess.check_output(cmd).decode("utf-8", errors="replace").splitlines()
 
-    cpu_usage = 0.0
-    top_cpu_list = []
-
-    # Regex to find CPU usage in line like: "%Cpu(s):  3.4 us,  1.2 sy, ..."
-    cpu_line_pattern = re.compile(r"^%Cpu\(s\):\s*(.*?)\s*us,.*")
-
+    # Find the header line (typically starts with "PID") and then parse the next five lines.
     header_index = 0
     for i, line in enumerate(output):
-        # Match CPU usage line
-        match_cpu = cpu_line_pattern.match(line.strip())
-        if match_cpu:
-            try:
-                # The matched group might look like "3.4" for user usage
-                cpu_usage = float(match_cpu.group(1))
-            except ValueError:
-                cpu_usage = 0.0
-
-        # Detect the table header line (commonly starts with "PID")
         if line.strip().startswith("PID"):
             header_index = i
             break
 
-    # The process lines typically begin after the header line
-    process_lines = output[header_index + 1 :]
-
-    # Each process line typically has columns:
-    #   PID USER PR NI VIRT RES SHR S %CPU %MEM TIME+ COMMAND
-    # We'll parse the first 5. We'll split with maxsplit=11 to keep the full COMMAND (column 12).
+    process_lines = output[header_index + 1:]
+    top_cpu_list = []
     for line in process_lines[:5]:
         cols = line.split(None, 11)
         if len(cols) < 12:
             continue
-        # command in cols[11], CPU usage in cols[8], etc.
         proc_name = cols[11]
-        proc_cpu = cols[8]
+        proc_cpu = cols[8]  # %CPU column
         top_cpu_list.append((proc_name, proc_cpu))
 
     return {
@@ -71,60 +54,35 @@ def get_top_cpu_info():
 
 def get_top_mem_info():
     """
-    Run top -b -n 1 -w 512 -c -o %MEM and parse:
-      - overall memory usage (as a percentage 0-100)
-      - top 5 processes by memory usage (full command, %MEM)
+    Get overall memory usage using psutil and top processes by memory usage.
+
     Returns dict with:
         {
-          "mem_usage": float,           # in range 0..100
+          "mem_usage": float,           # in percentage (0-100)
           "top_mem": [(proc_name, %MEM), ... up to 5]
         }
     """
+    # Use psutil for reliable overall memory usage percentage.
+    mem_usage = psutil.virtual_memory().percent
+
+    # Run top to get per-process memory info.
     cmd = ["top", "-b", "-n", "1", "-w", "512", "-c", "-o", "%MEM"]
     output = subprocess.check_output(cmd).decode("utf-8", errors="replace").splitlines()
 
-    mem_usage = 0.0
-    top_mem_list = []
-
-    # Example line in top output:
-    #   MiB Mem :  15852.9 total,  13007.2 free,   1649.1 used,   196.7 buff/cache
-    #
-    # We'll parse total (group 1) and used (group 3).
-    # If you want "used + buff/cache", adjust the formula below.
-    mem_line_pattern = re.compile(
-        r"^MiB Mem\s*:\s*(\S+)\s+total,\s*(\S+)\s+free,\s*(\S+)\s+used,\s*(\S+)\s+buff/cache"
-    )
-
     header_index = 0
     for i, line in enumerate(output):
-        match_mem = mem_line_pattern.match(line.strip())
-        if match_mem:
-            try:
-                total_mib = float(match_mem.group(1))
-                free_mib  = float(match_mem.group(2))
-                used_mib  = float(match_mem.group(3))
-                buff_mib  = float(match_mem.group(4))
-
-                # Calculate memory usage in percentage (used / total * 100)
-                # If you want to include buff/cache, do: (used_mib + buff_mib)
-                mem_usage = (used_mib / total_mib) * 100
-            except ValueError:
-                mem_usage = 0.0
-
-        # Detect the table header line (commonly starts with "PID")
         if line.strip().startswith("PID"):
             header_index = i
             break
 
-    process_lines = output[header_index + 1 :]
-
-    # Parse top 5 processes by memory usage
+    process_lines = output[header_index + 1:]
+    top_mem_list = []
     for line in process_lines[:5]:
         cols = line.split(None, 11)
         if len(cols) < 12:
             continue
         proc_name = cols[11]
-        proc_mem = cols[9]  # %MEM
+        proc_mem = cols[9]  # %MEM column
         top_mem_list.append((proc_name, proc_mem))
 
     return {
@@ -170,8 +128,6 @@ def get_nginx_stub_status(url=NGINX_STATUS_URL):
         active_connections = 0
 
     # Attempt to parse total requests
-    # Typically in the stub, the 3rd line has "server accepts handled requests"
-    # The next line might be something like " 1234 1234 2468"
     try:
         line_with_requests = lines[2].strip()
         parts = line_with_requests.split()
@@ -205,7 +161,6 @@ def compute_requests_per_second(current_requests):
             last_requests = state.get("last_requests", 0)
             last_time = state.get("last_time", now)
     except (json.JSONDecodeError, FileNotFoundError):
-        # If file is corrupted or not found
         last_requests = current_requests
         last_time = now
 
@@ -268,12 +223,12 @@ def main():
     #   nginx_active_connections, nginx_requests_ps ]
     row_items = [
         now_str,
-        str(f"{cpu_usage:.2f}"),
+        f"{cpu_usage:.2f}",
         *top_cpu_fields,     # 10 fields (5 name+usage pairs)
-        str(f"{mem_usage:.2f}"),
+        f"{mem_usage:.2f}",
         *top_mem_fields,     # 10 fields
         str(nginx_active_connections),
-        str(f"{nginx_requests_ps:.2f}")
+        f"{nginx_requests_ps:.2f}"
     ]
 
     # Join with ';'
