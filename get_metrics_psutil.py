@@ -8,8 +8,8 @@ import json
 
 # Configuration
 NGINX_STATUS_URL = "http://127.0.0.1/stub_status"
-OUTPUT_FILE = "/tmp/system_stats.csv"
-STATE_FILE = "/tmp/.nginx_requests_state.json"  # To store last requests count & timestamp
+OUTPUT_FILE = "/etc/zabbix/templates/host_anomaly_detection/data/system_stats.csv"
+STATE_FILE = "/etc/zabbix/templates/host_anomaly_detection/data/.nginx_requests_state.json"  # To store last requests count & timestamp
 
 def get_system_usage():
     """
