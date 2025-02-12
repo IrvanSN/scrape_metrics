@@ -5,6 +5,8 @@ import requests  # pip install requests
 import time
 import os
 import json
+import csv
+import io
 
 # Configuration
 NGINX_STATUS_URL = "http://127.0.0.1/stub_status"
@@ -16,7 +18,6 @@ def get_system_usage():
     Returns overall system CPU and memory usage.
     CPU usage is measured over a short interval.
     """
-    # This call blocks for 0.1 sec to measure CPU usage over that interval.
     cpu_usage = psutil.cpu_percent(interval=0.1)
     mem_usage = psutil.virtual_memory().percent
     return cpu_usage, mem_usage
@@ -28,7 +29,6 @@ def get_top_processes_info():
         top_cpu: list of tuples (process_command, cpu_percent)
         top_mem: list of tuples (process_command, mem_percent)
     """
-    # Gather all processes with basic info.
     procs = list(psutil.process_iter(['pid', 'name', 'cmdline']))
 
     # Initialize per-process CPU percent measurements.
@@ -38,7 +38,6 @@ def get_top_processes_info():
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
 
-    # Wait a short time to allow CPU usage to be computed.
     time.sleep(0.1)
 
     cpu_info_list = []
@@ -54,7 +53,6 @@ def get_top_processes_info():
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
 
-    # Sort and select the top 5 processes by CPU and memory usage.
     top_cpu = sorted(cpu_info_list, key=lambda x: x[1], reverse=True)[:5]
     top_mem = sorted(mem_info_list, key=lambda x: x[1], reverse=True)[:5]
     return top_cpu, top_mem
@@ -83,7 +81,6 @@ def get_nginx_stub_status(url=NGINX_STATUS_URL):
     active_connections = 0
     total_requests = 0
 
-    # Parse active connections.
     try:
         for line in lines:
             if line.startswith("Active connections:"):
@@ -94,7 +91,6 @@ def get_nginx_stub_status(url=NGINX_STATUS_URL):
     except (ValueError, IndexError):
         active_connections = 0
 
-    # Parse total requests from the third line (commonly in the format "1234 1234 2468").
     try:
         line_with_requests = lines[2].strip()
         parts = line_with_requests.split()
@@ -173,7 +169,7 @@ def main():
 
     now_str = datetime.datetime.now().isoformat()
 
-    # Compose the CSV row:
+    # Compose the CSV row items:
     # [timestamp; overall_cpu; (top 5 CPU process names & usages); overall_mem; (top 5 mem process names & usages);
     #  nginx_active_connections; nginx_requests_ps]
     row_items = [
@@ -185,11 +181,17 @@ def main():
         str(nginx_active_connections),
         f"{nginx_requests_ps:.2f}"
     ]
-    csv_line = ";".join(row_items) + "\n"
 
-    # Print the CSV line to console and append to output file.
+    # Use the csv module to generate a CSV line that properly quotes fields containing semicolons.
+    output = io.StringIO()
+    csv_writer = csv.writer(output, delimiter=";", quoting=csv.QUOTE_MINIMAL)
+    csv_writer.writerow(row_items)
+    csv_line = output.getvalue()
+    output.close()
+
+    # Print the CSV line to the console and append it to the output file.
     print(csv_line, end="")
-    with open(OUTPUT_FILE, "a") as f:
+    with open(OUTPUT_FILE, "a", newline="") as f:
         f.write(csv_line)
 
 if __name__ == "__main__":
